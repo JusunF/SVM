@@ -1,15 +1,50 @@
 import joblib
 import spacy
+import torch
+import torch.nn as nn
 from pathlib import Path
 
 MODEL_DIR = Path(__file__).resolve().parent
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # Load spaCy model
 nlp = spacy.load("en_core_web_trf")
 
-# Load trained SVM and TF-IDF
-model = joblib.load(MODEL_DIR / "svm_model.pkl")
+# Load trained model, label encoders and TF-IDF
+checkpoint = torch.load(MODEL_DIR / "tweet_model.pt", map_location=device)
+encoders = joblib.load(MODEL_DIR / "labels.pkl")
 vectorizer = joblib.load(MODEL_DIR / "tfidf.pkl")
+label_columns = checkpoint["label_columns"]
+
+
+class TweetClassifier(nn.Module):
+    """Must mirror the architecture used in train.py."""
+
+    def __init__(self, input_dim, n_classes, hidden=256, dropout=0.3):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.heads = nn.ModuleList(
+            [nn.Linear(hidden, n) for n in n_classes]
+        )
+
+    def forward(self, x):
+        h = self.backbone(x)
+        return [head(h) for head in self.heads]
+
+
+model = TweetClassifier(
+    checkpoint["input_dim"], checkpoint["n_classes"]
+).to(device)
+model.load_state_dict(checkpoint["state_dict"])
+model.eval()
 
 
 def extract_ner(text):
@@ -62,14 +97,26 @@ while True:
     if comment.lower() == "exit":
         break
 
-    comment_vector = vectorizer.transform([comment])
+    x_comment = torch.tensor(
+        vectorizer.transform([comment]).toarray(),
+        dtype=torch.float32,
+        device=device,
+    )
 
-    prediction = model.predict(comment_vector)
+    with torch.no_grad():
+        logits = model(x_comment)
 
-    sentiment = prediction[0][0]
-    emotion = prediction[0][1]
-    topic = prediction[0][2]
-    predicted_ner = prediction[0][3]
+    prediction = [
+        encoders[col].inverse_transform(
+            [torch.argmax(logits[i], dim=1).item()]
+        )[0]
+        for i, col in enumerate(label_columns)
+    ]
+
+    sentiment = prediction[0]
+    emotion = prediction[1]
+    topic = prediction[2]
+    predicted_ner = prediction[3]
 
     ner = extract_ner(comment)
 
