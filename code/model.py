@@ -8,99 +8,257 @@ try:
     import cupy as cp
     from cuml.feature_extraction.text import TfidfVectorizer
     from cuml.svm import LinearSVC
+
+    # Check whether a CUDA GPU is actually available
     GPU_AVAILABLE = cp.cuda.runtime.getDeviceCount() > 0
+
 except Exception:
     GPU_AVAILABLE = False
 
+
+# If GPU is not available, use scikit-learn instead
 if not GPU_AVAILABLE:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.svm import LinearSVC
 
-DEVICE = "cuda" if GPU_AVAILABLE else "cpu"
+# Store which device is being used
+if GPU_AVAILABLE:
+    DEVICE = "cuda"
+else:
+    DEVICE = "cpu"
 
-
+# TF-IDF Vectorizer
 def make_vectorizer(kwargs):
-    return TfidfVectorizer(**kwargs)
+    """
+    Create a TF-IDF vectorizer.
 
+    The vectorizer will be:
+    - cuML version if GPU is available
+    - scikit-learn version otherwise
+    """
 
+    vectorizer = TfidfVectorizer(**kwargs)
+
+    return vectorizer
+
+# Convert Data to Numpy
 def to_numpy(values):
-    return cp.asnumpy(values) if GPU_AVAILABLE else np.asarray(values)
-
-
-WEIGHT_CAP = 10.0  # same cap the BiLSTM and RoBERTa-CNN losses apply
-
-
-def class_weights(target) -> dict[int, float]:
-    """Inverse-frequency weight per class: min(n / (k * count), WEIGHT_CAP).
-
-    n is the number of samples and k the number of classes present, so a class
-    appearing less often than average weighs more than 1. The cap keeps a very
-    rare class from dominating the objective, and matches the weighting the
-    BiLSTM and RoBERTa-CNN build into their CrossEntropyLoss.
     """
-    counts = np.bincount(np.asarray(target))
-    n, k = len(target), (counts > 0).sum()
-    return {
-        i: min(n / (k * count), WEIGHT_CAP) for i, count in enumerate(counts) if count > 0
-    }
+    Convert data into a NumPy array.
 
+    If GPU is being used, move the data from GPU to CPU first.
+    """
 
+    if GPU_AVAILABLE:
+        return cp.asnumpy(values)
+
+    return np.asarray(values)
+
+# Maximum class weight
+WEIGHT_CAP = 10.0
+
+# Calculate Class Weights
+def class_weights(target):
+    """
+    Calculate an inverse-frequency weight for each class.
+
+    Rare classes receive larger weights.
+    Common classes receive smaller weights.
+
+    The maximum weight is limited to WEIGHT_CAP.
+    """
+
+    # Count how many samples belong to each class
+    target_array = np.asarray(target)
+    counts = np.bincount(target_array)
+
+    # Total number of samples
+    number_of_samples = len(target_array)
+
+    # Count how many classes are present
+    number_of_classes = (counts > 0).sum()
+
+    weights = {}
+
+    # Calculate the weight for each class
+    for class_id, count in enumerate(counts):
+
+        # Ignore classes that do not appear in the dataset
+        if count == 0:
+            continue
+
+        # Inverse-frequency class weight
+        weight = number_of_samples / (
+            number_of_classes * count
+        )
+
+        # Do not allow the weight to exceed 10
+        if weight > WEIGHT_CAP:
+            weight = WEIGHT_CAP
+
+        weights[class_id] = weight
+
+    return weights
+
+# Train classification SVM models
 def train_models(features, single_targets):
-    """Fit one multiclass SVM per task.
-
-    Class-weighted with class_weights(). cuML's LinearSVC takes no
-    class_weight argument, so on GPU the same weights are applied per row
-    through sample_weight instead; both routes optimise the same objective.
     """
+    Train one multiclass Linear SVM for each task.
+
+    Example tasks could be:
+        sentiment
+        emotion
+        topic
+
+    Each task gets its own SVM model.
+    """
+
     models = {}
+
+    # Train one model for each task
     for task in TASKS:
+
+        # Get the labels for this task
         target = single_targets[task]
+
+        # Calculate class weights
         weights = class_weights(target)
-        sample_weight = np.array([weights[int(value)] for value in target], dtype=np.float32)
+
+        # Create one weight for every training sample
+        sample_weight = []
+
+        for value in target:
+            class_id = int(value)
+            weight = weights[class_id]
+
+            sample_weight.append(weight)
+
+        # Convert sample weights to NumPy
+        sample_weight = np.array(
+            sample_weight,
+            dtype=np.float32
+        )
+
         if GPU_AVAILABLE:
-            models[task] = LinearSVC().fit(
-                features, cp.asarray(target), sample_weight=cp.asarray(sample_weight)
+
+            # Move target labels to GPU
+            gpu_target = cp.asarray(target)
+
+            # Move sample weights to GPU
+            gpu_sample_weight = cp.asarray(sample_weight)
+
+            # Train the GPU SVM
+            model = LinearSVC()
+
+            model.fit(
+                features,
+                gpu_target,
+                sample_weight=gpu_sample_weight
             )
+
         else:
-            models[task] = LinearSVC(class_weight=weights).fit(features, target)
+
+            # Train the CPU SVM
+            model = LinearSVC(
+                class_weight=weights
+            )
+
+            model.fit(
+                features,
+                target
+            )
+
+        # Save the trained model
+        models[task] = model
+
     return models
 
-
-def ner_features_to_matrix(ner_vectorizer, token_dicts: list[dict]):
-    """DictVectorizer -> sparse matrix, downcast to int32 indices.
-
-    DictVectorizer can emit int64-indexed sparse matrices depending on the
-    scipy build; sklearn's LinearSVC sparse fit/predict path requires 32-bit
-    indices and raises otherwise. Every caller feeding the NER tagger (train
-    and predict) goes through this, not just fit time.
+# Prepare NER Features
+def ner_features_to_matrix(ner_vectorizer, token_dicts):
     """
-    matrix = ner_vectorizer.transform(token_dicts).tocsr()
+    Convert NER token dictionaries into a sparse matrix.
+
+    DictVectorizer converts the token dictionaries into
+    numerical features.
+
+    The sparse matrix indices are converted to int32 because
+    sklearn LinearSVC requires 32-bit indices in this case.
+    """
+
+    # Convert dictionaries into a sparse matrix
+    matrix = ner_vectorizer.transform(token_dicts)
+
+    # Convert matrix to CSR format
+    matrix = matrix.tocsr()
+
+    # Convert sparse matrix indices to int32
     matrix.indices = matrix.indices.astype(np.int32)
+
+    # Convert sparse matrix pointers to int32
     matrix.indptr = matrix.indptr.astype(np.int32)
+
     return matrix
 
-
-def train_ner_tagger(X_dicts: list[dict], y_tags: list[str], tag_labels: list[str]):
-    """Train a per-token BIO tagger: DictVectorizer + a class-weighted LinearSVC.
-
-    Always CPU (sklearn), regardless of GPU_AVAILABLE - cuML has no
-    DictVectorizer equivalent, and per-token feature matrices are small
-    enough that this isn't a bottleneck either way.
-
-    tag_labels fixes the tag -> integer mapping so predict-time decoding
-    matches training exactly, independent of which tags happen to appear in
-    this particular split.
+# Train NER SVM
+def train_ner_tagger(X_dicts, y_tags, tag_labels):
     """
+    Train a token-level BIO NER tagger.
+
+    The NER pipeline is:
+
+        Feature dictionaries
+                ↓
+        DictVectorizer
+                ↓
+        Sparse matrix
+                ↓
+        Class-weighted LinearSVC
+    """
+    # NER always uses scikit-learn
+    # because cuML does not provide DictVectorizer
     from sklearn.feature_extraction import DictVectorizer
     from sklearn.svm import LinearSVC as CPULinearSVC
 
-    tag_to_id = {tag: i for i, tag in enumerate(tag_labels)}
-    target = np.array([tag_to_id[tag] for tag in y_tags])
+    # Convert NER tag names into numbers
+    tag_to_id = {}
 
-    vectorizer = DictVectorizer(sparse=True)
+    for i, tag in enumerate(tag_labels):
+        tag_to_id[tag] = i
+
+    # Convert the string labels into integer labels
+    target = []
+
+    for tag in y_tags:
+        target.append(tag_to_id[tag])
+
+    target = np.array(target)
+
+    # Create the NER feature vectorizer
+    vectorizer = DictVectorizer(
+        sparse=True
+    )
+
+    # Learn the available features
     vectorizer.fit(X_dicts)
-    features = ner_features_to_matrix(vectorizer, X_dicts)
 
+    # Convert token dictionaries into a sparse matrix
+    features = ner_features_to_matrix(
+        vectorizer,
+        X_dicts
+    )
+
+    # Calculate class weights
     weights = class_weights(target)
-    tagger = CPULinearSVC(class_weight=weights).fit(features, target)
+
+    # Train the NER SVM
+    tagger = CPULinearSVC(
+        class_weight=weights
+    )
+
+    tagger.fit(
+        features,
+        target
+    )
+
+    # Return both the vectorizer and trained model
     return vectorizer, tagger
